@@ -119,7 +119,7 @@
 ## 8. 实操记录（2025-11-21）
 - **Backbone 实现**：在 `src/nn/backbone/dinov3_backbone.py` 中加载 `timm` ViT，小型 Conv 头负责生成 8/16/32 stride 特征；支持 `checkpoint_path` (`../../dinov3_vits16_pretrain_lvd1689m-08c60483.pth`) 和 `freeze_backbone` 选项。
 - **Registry 更新**：`src/nn/backbone/__init__.py` 引入 `DINOv3Backbone`，可直接在 YAML 中引用。
-- **配置落地**：`configs/dfine/dfine_dinov3_s_coco.yml` 覆盖 `DFINE.backbone`、`HybridEncoder.in_channels` 及优化器分组，默认 backbone LR=1e-5，其他部分沿用 2.5e-4。
+- **配置落地**：`configs/dfine/dfine_dinov3_s_coco.yml` 覆盖 `DFINE.backbone`、`HybridEncoder.in_channels` 及优化器分组，backbone LR=1e-5，其他参数组在单卡模式下缩放到 8e-5。
 - **训练命令**：
   ```bash
   cd D-FINE
@@ -134,6 +134,18 @@
     -c configs/dfine/dfine_dinov3_s_coco.yml \
     --test-only -r output/dfine_dinov3_s_coco/best.pth
   ```
+- **单卡 16G 调优**（2025-11-21 补充）
+  - 在 `configs/dfine/dfine_dinov3_s_coco.yml` 中将 `train_dataloader.total_batch_size=4`、`val_dataloader.total_batch_size=8`，适配单卡 5080 (16G)。
+  - 线性缩放基础学习率：`optimizer.lr=8e-5`，`backbone` 子组仍为 1e-5。
+  - 推荐训练命令：
+    ```bash
+    CUDA_VISIBLE_DEVICES=0 \
+    torchrun --master_port=29500 --nproc_per_node=1 \
+      train.py -c configs/dfine/dfine_dinov3_s_coco.yml \
+      --use-amp --seed=0
+    ```
+  - 若显存仍紧张，可在命令行添加 `--opts train_dataloader.num_workers=2` 或将 `HybridEncoder.num_encoder_layers` 设为 0，或借助 `torch.utils.checkpoint`（需额外改动）。
+
 - **后续动作**：若需先冻结 backbone，可将 `configs/dfine/dfine_dinov3_s_coco.yml` 中 `freeze_backbone_epochs` 设为 >0，并在训练 loop 中根据 epoch 手动切换 `requires_grad`（或直接改 `DINOv3Backbone` 初始化为 `freeze_backbone: True` 后再在特定 epoch 手动解冻）。
 
 完成以上步骤，即可用 DINOv3 成功替换 DFINE 的编码器，并在 8 卡服务器上满足 25M 参数预算的训练需求。祝实验顺利！
