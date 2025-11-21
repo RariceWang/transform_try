@@ -15,9 +15,9 @@
 ---
 
 ## 2. 资源准备
-1. **权重**：从 HuggingFace 拉取 `facebook/dinov3-small` (约 23M 参数)；如需离线部署可提前下载到 `weight/dinov3/`。
-2. **依赖**：确认 `pip install -r requirements.txt`，若使用 HuggingFace Hub 需 `huggingface_hub`；可选 `timm>=1.0`。
-3. **代码入口**：新建 `src/nn/backbone/dinov3_backbone.py`；在 `src/nn/backbone/__init__.py` 中注册。
+1. **权重**：已将官方 `dinov3_vits16_pretrain_lvd1689m-08c60483.pth` 放在仓库根目录（`../../dinov3_vits16_pretrain_lvd1689m-08c60483.pth` 相对 `D-FINE`）。
+2. **依赖**：确认 `pip install -r requirements.txt`，并提供 `timm>=1.0`（用于加载 ViT）；若需 Hub 拉取，安装 `huggingface_hub`。
+3. **代码入口**：实现 `src/nn/backbone/dinov3_backbone.py` 并在 `src/nn/backbone/__init__.py` 注册；新增配置 `configs/dfine/dfine_dinov3_s_coco.yml`。
 
 ---
 
@@ -44,13 +44,13 @@
    - 通过自定义 `forward_features` 获取最后一层 token (包含 CLS token)；丢弃 CLS，只保留 patch tokens。
    - reshape：`tokens = tokens[:, 1:, :].transpose(1, 2)` → `B×C×H×W`。
 
-2. **构建 STA/FPN** (`src/nn/backbone/modules/dinov3_sta.py`)
-   - 三个分支分别负责 P8/P16/P32。
-   - 引入可选 LayerNorm + 1×1 Conv 以稳定训练。
-   - 输出通道统一为 256，便于接入现有 HybridEncoder。
+2. **构建多尺度头**（集成在 `DINOv3Backbone` 中）
+  - 利用 1×1 Conv 将 token map 投影到 256 通道。
+  - `P8`: 2× 上采样后接 1×1 Conv；`P16`: 1×1 Conv；`P32`: 3×3 stride-2 Conv。
+  - 输出 `[P8, P16, P32]`，直接与 HybridEncoder 对接。
 
 3. **更新 Config**
-   - 复制 `configs/dfine/dfine_hgnetv2_l_coco.yml` 为 `configs/dfine/dfine_dinov3s_coco.yml`。
+  - 复制 `configs/dfine/dfine_hgnetv2_l_coco.yml` 为 `configs/dfine/dfine_dinov3_s_coco.yml`。
    - 修改：
      ```yaml
      DFINE:
@@ -73,7 +73,7 @@
      ```bash
      CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
      torchrun --master_port=29500 --nproc_per_node=8 \
-       train.py -c configs/dfine/dfine_dinov3s_coco.yml \
+       train.py -c configs/dfine/dfine_dinov3_s_coco.yml \
        --use-amp --seed=0
      ```
    - 每卡 batch=2，梯度累计 1；若显存不足，使用 `--opt-level O2` 或梯度累积 2。
@@ -82,7 +82,7 @@
    - 保存 best.pth 后执行：
      ```bash
      torchrun --nproc_per_node=8 train.py \
-       -c configs/dfine/dfine_dinov3s_coco.yml \
+       -c configs/dfine/dfine_dinov3_s_coco.yml \
        --test-only -r output/dfine_dinov3s_coco/best.pth
      ```
    - 检查 `loss_vfl`、`loss_bbox` 曲线是否平稳；比较 AP 与 HGNetv2 基线。
@@ -108,10 +108,32 @@
 ---
 
 ## 7. Checklist
-- [ ] `DINOv3Backbone` 类实现并注册。
-- [ ] STA 模块输出 3 个尺度，通道=256。
-- [ ] Config/optimizer/EMA 更新就绪。
-- [ ] 8 卡训练命令可运行，日志正常。
+- [x] `DINOv3Backbone` 类实现并注册（见 `src/nn/backbone/dinov3_backbone.py`）。
+- [x] 多尺度头输出 `[P8, P16, P32]`，通道=256。
+- [x] Config/optimizer/EMA 更新（`configs/dfine/dfine_dinov3_s_coco.yml`）。
+- [ ] 8 卡训练命令验证通过（待真实训练确认日志）。
 - [ ] 推理/评估脚本验证精度。
+
+---
+
+## 8. 实操记录（2025-11-21）
+- **Backbone 实现**：在 `src/nn/backbone/dinov3_backbone.py` 中加载 `timm` ViT，小型 Conv 头负责生成 8/16/32 stride 特征；支持 `checkpoint_path` (`../../dinov3_vits16_pretrain_lvd1689m-08c60483.pth`) 和 `freeze_backbone` 选项。
+- **Registry 更新**：`src/nn/backbone/__init__.py` 引入 `DINOv3Backbone`，可直接在 YAML 中引用。
+- **配置落地**：`configs/dfine/dfine_dinov3_s_coco.yml` 覆盖 `DFINE.backbone`、`HybridEncoder.in_channels` 及优化器分组，默认 backbone LR=1e-5，其他部分沿用 2.5e-4。
+- **训练命令**：
+  ```bash
+  cd D-FINE
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  torchrun --master_port=29500 --nproc_per_node=8 \
+    train.py -c configs/dfine/dfine_dinov3_s_coco.yml \
+    --use-amp --seed=0
+  ```
+- **推理命令**：
+  ```bash
+  torchrun --nproc_per_node=8 train.py \
+    -c configs/dfine/dfine_dinov3_s_coco.yml \
+    --test-only -r output/dfine_dinov3_s_coco/best.pth
+  ```
+- **后续动作**：若需先冻结 backbone，可将 `configs/dfine/dfine_dinov3_s_coco.yml` 中 `freeze_backbone_epochs` 设为 >0，并在训练 loop 中根据 epoch 手动切换 `requires_grad`（或直接改 `DINOv3Backbone` 初始化为 `freeze_backbone: True` 后再在特定 epoch 手动解冻）。
 
 完成以上步骤，即可用 DINOv3 成功替换 DFINE 的编码器，并在 8 卡服务器上满足 25M 参数预算的训练需求。祝实验顺利！
